@@ -4,12 +4,14 @@ use core::ptr::{self, NonNull};
 
 use critical_section::Mutex;
 use linked_list_allocator::Heap as LLHeap;
+use log::info;
 
 /// A linked list first fit heap.
 pub struct Heap {
-    heap: Mutex<RefCell<LLHeap>>,
+    fast: Mutex<RefCell<LLHeap>>,
+    slow: Mutex<RefCell<LLHeap>>,
 }
-
+const THRESHOLD: usize = 2048;
 impl Heap {
     /// Create a new UNINITIALIZED heap allocator
     ///
@@ -17,7 +19,8 @@ impl Heap {
     /// [`init`](Self::init) method before using the allocator.
     pub const fn empty() -> Heap {
         Heap {
-            heap: Mutex::new(RefCell::new(LLHeap::empty())),
+            fast: Mutex::new(RefCell::new(LLHeap::empty())),
+            slow: Mutex::new(RefCell::new(LLHeap::empty())),
         }
     }
 
@@ -45,41 +48,78 @@ impl Heap {
     ///
     /// - This function must be called exactly ONCE.
     /// - `size > 0`
-    pub unsafe fn init(&self, start_addr: usize, size: usize) {
+    pub unsafe fn init(
+        &self,
+        fast_start_addr: usize,
+        fast_size: usize,
+        slow_start_addr: usize,
+        slow_size: usize,
+    ) {
         critical_section::with(|cs| {
-            self.heap
+            self.fast
                 .borrow(cs)
                 .borrow_mut()
-                .init(start_addr as *mut u8, size);
+                .init(fast_start_addr as *mut u8, fast_size);
+            self.slow
+                .borrow(cs)
+                .borrow_mut()
+                .init(slow_start_addr as *mut u8, slow_size);
         });
     }
 
     /// Returns an estimate of the amount of bytes in use.
-    pub fn used(&self) -> usize {
-        critical_section::with(|cs| self.heap.borrow(cs).borrow_mut().used())
+    pub fn used(&self) -> (usize, usize) {
+        critical_section::with(|cs| {
+            (
+                self.fast.borrow(cs).borrow_mut().used(),
+                self.slow.borrow(cs).borrow_mut().used(),
+            )
+        })
     }
 
     /// Returns an estimate of the amount of bytes available.
-    pub fn free(&self) -> usize {
-        critical_section::with(|cs| self.heap.borrow(cs).borrow_mut().free())
+    pub fn free(&self) -> (usize, usize) {
+        critical_section::with(|cs| {
+            (
+                self.fast.borrow(cs).borrow_mut().free(),
+                self.slow.borrow(cs).borrow_mut().free(),
+            )
+        })
     }
 
     fn alloc(&self, layout: Layout) -> Option<NonNull<u8>> {
+        info!("alloc: {:?}", layout);
         critical_section::with(|cs| {
-            self.heap
-                .borrow(cs)
-                .borrow_mut()
-                .allocate_first_fit(layout)
-                .ok()
+            if layout.size() <= THRESHOLD {
+                self.fast
+                    .borrow(cs)
+                    .borrow_mut()
+                    .allocate_first_fit(layout)
+                    .ok()
+            } else {
+                self.slow
+                    .borrow(cs)
+                    .borrow_mut()
+                    .allocate_first_fit(layout)
+                    .ok()
+            }
         })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        info!("dealloc: {:?}", layout);
         critical_section::with(|cs| {
-            self.heap
-                .borrow(cs)
-                .borrow_mut()
-                .deallocate(NonNull::new_unchecked(ptr), layout)
+            if layout.size() <= THRESHOLD {
+                self.fast
+                    .borrow(cs)
+                    .borrow_mut()
+                    .deallocate(NonNull::new_unchecked(ptr), layout)
+            } else {
+                self.slow
+                    .borrow(cs)
+                    .borrow_mut()
+                    .deallocate(NonNull::new_unchecked(ptr), layout)
+            }
         });
     }
 }
